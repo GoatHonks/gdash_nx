@@ -1,6 +1,6 @@
 <div align=center>
 
-<img src="extras/banner.png" alt="Banner" width="40%">
+<img src="extras/banner.png" alt="Banner" width="60%">
 
 </div>
 <h1 align=center>Geometry Dash · Switch Port</h1>
