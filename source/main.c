@@ -161,6 +161,8 @@ static void save_files_init(void) {
 static struct {
   void *(*ccFileUtils)(void);                       // CCFileUtils::sharedFileUtils()
   void (*ccAddSearchPath)(void *self, const char *); // ::addSearchPath(const char*)
+  void *(*gmSharedState)(void);                     // GameManager::sharedState()
+  void (*gmDoQuickSave)(void *self);                // GameManager::doQuickSave()
   void (*init)(void *env, void *thiz, int w, int h);
   void (*render)(void *env, void *thiz);
   void (*onPause)(void *env, void *thiz);
@@ -187,6 +189,8 @@ static int (*game_JNI_OnLoad)(void *vm, void *reserved);
 static void resolve_gd_exports(void) {
   RESOLVE(ccFileUtils,     "_ZN7cocos2d11CCFileUtils15sharedFileUtilsEv");
   RESOLVE(ccAddSearchPath, "_ZN7cocos2d11CCFileUtils13addSearchPathEPKc");
+  RESOLVE_OPT(gmSharedState, "_ZN11GameManager11sharedStateEv");
+  RESOLVE_OPT(gmDoQuickSave, "_ZN11GameManager11doQuickSaveEv");
   RESOLVE(init,          "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeInit");
   RESOLVE(render,        "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeRender");
   RESOLVE(onPause,       "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeOnPause");
@@ -517,7 +521,34 @@ static void update_input(void) {
     gd.keyDown(fake_env, NULL, AKEY_BACK);
 }
 
-// ---------------------------------------------------------------------------
+static AppletHookCookie s_applet_hook;
+static int s_app_focused = 1;
+
+// GD only saves on background/quit, which is unreliable on Switch; call its
+// own quick-save directly.
+static void force_save(void) {
+  if (gd.gmSharedState && gd.gmDoQuickSave) {
+    void *gm = gd.gmSharedState();
+    if (gm)
+      gd.gmDoQuickSave(gm);
+  }
+}
+
+// pause/resume + save on focus change (HOME), like Android onPause/onResume
+static void applet_focus_hook(AppletHookType type, void *param) {
+  (void)param;
+  if (type != AppletHookType_OnFocusState)
+    return;
+  const int focused = (appletGetFocusState() == AppletFocusState_InFocus);
+  if (focused && !s_app_focused) {
+    s_app_focused = 1;
+    gd.onResume(fake_env, NULL);
+  } else if (!focused && s_app_focused) {
+    s_app_focused = 0;
+    gd.onPause(fake_env, NULL);
+    force_save();
+  }
+}
 
 int main(int argc, char **argv) {
   pthr_pin_render_core();
@@ -565,21 +596,16 @@ int main(int argc, char **argv) {
   fmod_hooks_init(&fmod_mod);
   resolve_gd_exports();
 
-  // OPENSSL_cpuid_setup() is a static constructor that probes CPU features via a
-  // SIGILL handler + longjmp; the so-loader has no signal delivery, so it faults
-  // in the game's .init_array. Neutralize it -- OpenSSL then uses its portable C
-  // paths. Patch the writable mirror before so_finalize maps it RX.
+  // OPENSSL_cpuid_setup (a static ctor) probes the CPU with a SIGILL/longjmp
+  // harness that faults without signal delivery; neutralize it -> portable C.
   {
     uintptr_t cpuid = so_try_find_addr(&game_mod, "OPENSSL_cpuid_setup");
     if (cpuid)
       hook_arm64(cpuid, (uintptr_t)&ret0);
   }
 
-  // The loose-assets search path we install below lives on the CCFileUtils
-  // instance. GameManager::reloadAllStep2() (texture-quality change) calls
-  // CCFileUtils::purgeFileUtils(), which would destroy that instance -- and the
-  // game never re-adds search paths -- so assets would fail to load afterwards.
-  // Neutralize the purge so the instance and its search path persist.
+  // Keep the loose-assets search path alive: purgeFileUtils() (on a texture-
+  // quality change) would drop it and the game never re-adds it.
   {
     uintptr_t purge = so_try_find_addr(&game_mod, "_ZN7cocos2d11CCFileUtils14purgeFileUtilsEv");
     if (purge)
@@ -606,9 +632,8 @@ int main(int argc, char **argv) {
   if (game_JNI_OnLoad)
     game_JNI_OnLoad(fake_vm, NULL);
 
-  // Read all assets as loose files from <base>/assets/. cocos2d treats an
-  // absolute ('/'-rooted) search path as the filesystem, so it fopen()s each
-  // asset directly -- no .apk needed. The game never sets its own search paths.
+  // load assets loose from <base>/assets/: cocos2d fopen()s an absolute
+  // ('/'-rooted) search path directly, so no .apk is needed
   gd.ccAddSearchPath(gd.ccFileUtils(), path_assets_search());
 
   // input before first frame
@@ -624,15 +649,24 @@ int main(int argc, char **argv) {
 
   cpu_boost(0);
 
+  appletHook(&s_applet_hook, applet_focus_hook, NULL);
+
+  unsigned frame = 0;
   while (appletMainLoop() && !g_quit) {
     update_input();
     gd.render(fake_env, NULL);
     cursor_render();
     eglSwapBuffers(s_dpy, s_surf);
+    if (++frame >= 60 * 20) { // ~20 s autosave
+      frame = 0;
+      force_save();
+    }
   }
 
-  // Android saves on pause; give the game its onPause so nothing is lost
-  gd.onPause(fake_env, NULL);
+  if (s_app_focused) { // clean in-game quit; background path already saved
+    gd.onPause(fake_env, NULL);
+    force_save();
+  }
   svcSleepThread(200000000ull); // 200 ms for save writes on worker threads
 
   eglMakeCurrent(s_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);

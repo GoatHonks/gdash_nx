@@ -215,6 +215,23 @@ void fmod_hooks_init(so_module *fmod) {
   real_fmod_createStream = (FmodCreateFn)so_find_addr_rx(fmod, FMOD_SYM_CREATESTREAM);
 }
 
+// --- shims for symbols newlib lacks (used by the newer SubZero 2.2.147 NDK) --
+
+static int sched_yield_fake(void) {
+  svcSleepThread(0);
+  return 0;
+}
+
+static int __signbit_fake(double x) {
+  return signbit(x) ? 1 : 0;
+}
+
+// thread-local destructor registration: we don't run TLS dtors, so drop it
+static int __cxa_thread_atexit_impl_fake(void (*func)(void *), void *obj, void *dso) {
+  (void)func; (void)obj; (void)dso;
+  return 0;
+}
+
 // ---------------------------------------------------------------------------
 // import table
 // ---------------------------------------------------------------------------
@@ -646,6 +663,62 @@ DynLibFunction dynlib_functions[] = {
   { "sem_post", (uintptr_t)&sem_post_fake },
   { "sem_trywait", (uintptr_t)&sem_trywait_fake },
   { "sem_wait", (uintptr_t)&sem_wait_fake },
+
+  // --- SubZero 2.2.147 delta: extra libc imports from its newer NDK ---------
+  { "__cxa_thread_atexit_impl", (uintptr_t)&__cxa_thread_atexit_impl_fake },
+  { "__signbit", (uintptr_t)&__signbit_fake },
+  { "closelog", (uintptr_t)&ret0 },
+  { "openlog", (uintptr_t)&ret0 },
+  { "sched_yield", (uintptr_t)&sched_yield_fake },
+  { "abs", (uintptr_t)&abs },
+  { "asinhf", (uintptr_t)&asinhf },
+  { "tanhf", (uintptr_t)&tanhf },
+  { "isascii", (uintptr_t)&isascii },
+  { "fseeko", (uintptr_t)&fseeko },
+  { "ftello", (uintptr_t)&ftello },
+  { "vasprintf", (uintptr_t)&vasprintf },
+  { "vsscanf", (uintptr_t)&vsscanf },
+  { "newlocale", (uintptr_t)&newlocale_fake },
+  { "freelocale", (uintptr_t)&freelocale_fake },
+  { "uselocale", (uintptr_t)&uselocale_fake },
+  { "strtold_l", (uintptr_t)&strtold_l_fake },
+  { "strtoll_l", (uintptr_t)&strtoll_l_fake },
+  { "strtoull_l", (uintptr_t)&strtoull_l_fake },
+  { "mbsnrtowcs", (uintptr_t)&mbsnrtowcs_fake },
+  { "wcsnrtombs", (uintptr_t)&wcsnrtombs_fake },
+  { "isdigit_l", (uintptr_t)&isdigit_l },
+  { "islower_l", (uintptr_t)&islower_l },
+  { "isupper_l", (uintptr_t)&isupper_l },
+  { "isxdigit_l", (uintptr_t)&isxdigit_l },
+  { "tolower_l", (uintptr_t)&tolower_l },
+  { "toupper_l", (uintptr_t)&toupper_l },
+  { "iswalpha_l", (uintptr_t)&iswalpha_l },
+  { "iswblank_l", (uintptr_t)&iswblank_l },
+  { "iswcntrl_l", (uintptr_t)&iswcntrl_l },
+  { "iswdigit_l", (uintptr_t)&iswdigit_l },
+  { "iswlower_l", (uintptr_t)&iswlower_l },
+  { "iswprint_l", (uintptr_t)&iswprint_l },
+  { "iswpunct_l", (uintptr_t)&iswpunct_l },
+  { "iswspace_l", (uintptr_t)&iswspace_l },
+  { "iswupper_l", (uintptr_t)&iswupper_l },
+  { "iswxdigit_l", (uintptr_t)&iswxdigit_l },
+  { "towlower_l", (uintptr_t)&towlower_l },
+  { "towupper_l", (uintptr_t)&towupper_l },
+  { "strcoll_l", (uintptr_t)&strcoll_l },
+  { "strxfrm_l", (uintptr_t)&strxfrm_l },
+  { "strftime_l", (uintptr_t)&strftime_l },
+  { "wcscoll_l", (uintptr_t)&wcscoll_l },
+  { "wcsxfrm_l", (uintptr_t)&wcsxfrm_l },
+  { "mbrlen", (uintptr_t)&mbrlen },
+  { "mbsrtowcs", (uintptr_t)&mbsrtowcs },
+  { "mbtowc", (uintptr_t)&mbtowc },
+  { "wcstod", (uintptr_t)&wcstod },
+  { "wcstof", (uintptr_t)&wcstof },
+  { "wcstol", (uintptr_t)&wcstol },
+  { "wcstold", (uintptr_t)&wcstold },
+  { "wcstoll", (uintptr_t)&wcstoll },
+  { "wcstoul", (uintptr_t)&wcstoul },
+  { "wcstoull", (uintptr_t)&wcstoull },
 };
 
 size_t dynlib_numfunctions = sizeof(dynlib_functions) / sizeof(*dynlib_functions);
