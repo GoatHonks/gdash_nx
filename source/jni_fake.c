@@ -23,11 +23,13 @@
 #include <switch.h>
 
 #include "config.h"
+#include "game_compat.h"
 #include "paths.h"
 #include "util.h"
 #include "jni_fake.h"
 #include "prefs.h"
 #include "audio.h"
+#include "net_shim.h"
 
 #define JNI_OK 0
 #define JNI_VERSION_1_6 0x00010006
@@ -214,7 +216,7 @@ static juint call_boolean(const char *name, const char *sig, va_list va) {
     return (juint)prefs_get_bool(key, def);
   }
   if (!strcmp(name, "isNetworkAvailable"))
-    return 1;
+    return net_is_available();
   if (!strcmp(name, "gameServicesIsSignedIn"))
     return 0;
   return 0;
@@ -287,11 +289,11 @@ static void *call_object(const char *name, va_list va) {
     return jni_make_object("AssetManager");
 
   if (!strcmp(name, "getUserID"))
-    return jni_make_string("0");
+    return jni_make_string(net_user_id());
   if (!strcmp(name, "getCocos2dxWritablePath"))
     return jni_make_string(path_save());
   if (!strcmp(name, "getCocos2dxPackageName"))
-    return jni_make_string(GD_PACKAGE_NAME);
+    return jni_make_string(game_compat_package_name());
   if (!strcmp(name, "getCurrentLanguage"))
     return jni_make_string(config_lang_iso2());
   if (!strcmp(name, "getStringForKey")) {

@@ -17,7 +17,13 @@ const char *path_assets_search(void); // "<base>/assets/" (cocos search path)
 const char *path_save(void);          // "<base>/save"
 const char *path_prefs(void);         // "<base>/prefs.txt"
 const char *path_config(void);        // "<base>/config.txt"
+const char *path_ca_bundle(void);     // "<base>/cacert.pem"
 const char *path_so_game(void);       // "<base>/libcocos2dcpp.so"
 const char *path_so_fmod(void);       // "<base>/libfmod.so"
+
+// Return the part after an Android app-private package directory, or NULL
+// when path is not under a recognized private-data root. The returned pointer
+// aliases path and may point at its trailing NUL for the package directory.
+const char *path_android_private_suffix(const char *path);
 
 #endif

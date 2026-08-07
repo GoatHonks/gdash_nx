@@ -1,9 +1,9 @@
 /* config.h -- global configuration and config file handling.
  *
- * Geometry Dash (Android, com.robtopx.geometryjump, 2.2.14x arm64) on Switch:
+ * Geometry Dash and its free variants (Android 2.2.14x arm64) on Switch:
  * RobTop's cocos2d-x 2.2 fork in libcocos2dcpp.so plus the stock arm64
- * libfmod.so, both loaded natively. File paths are resolved at runtime from the
- * .nro location (see paths.h).
+ * libfmod.so, both loaded natively. File paths are resolved at runtime from
+ * the .nro location (see paths.h).
  *
  * This software may be modified and distributed under the terms
  * of the MIT license.  See the LICENSE file for details.
@@ -27,10 +27,7 @@
 #define ANDROID_ASSET_URI     "file:///android_asset/"
 #define ANDROID_ASSET_URI_LEN 22
 
-// The game hardcodes its Android data dir in a few places; fix_path() maps it
-// onto the save dir.
-#define ANDROID_DATA_PREFIX "/data/data/com.robtopx.geometryjump/"
-
+// Fallback when the package marker cannot be detected in libcocos2dcpp.so.
 #define GD_PACKAGE_NAME "com.robtopx.geometryjump"
 
 // actual render/surface size (picked at runtime from docked state)

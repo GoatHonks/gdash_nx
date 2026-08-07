@@ -29,6 +29,7 @@
 #include <switch.h>
 
 #include "config.h"
+#include "game_compat.h"
 #include "paths.h"
 #include "util.h"
 #include "error.h"
@@ -561,6 +562,7 @@ int main(int argc, char **argv) {
 
   check_syscalls();
   check_data();
+  game_compat_detect_package(path_so_game());
   set_screen_size(config.screen_width, config.screen_height);
 
   extern char *fake_heap_start;
@@ -593,6 +595,7 @@ int main(int argc, char **argv) {
   so_relocate(&game_mod);
   so_resolve(&game_mod, dynlib_functions, dynlib_numfunctions, 1);
 
+  game_compat_apply_network(&game_mod);
   fmod_hooks_init(&fmod_mod);
   resolve_gd_exports();
 
@@ -673,6 +676,7 @@ int main(int argc, char **argv) {
   eglDestroyContext(s_dpy, s_ctx);
   eglDestroySurface(s_dpy, s_surf);
   eglTerminate(s_dpy);
+  net_exit();
 
   extern void NX_NORETURN __libnx_exit(int rc);
   __libnx_exit(0);

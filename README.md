@@ -5,18 +5,18 @@
 </div>
 <h1 align=center>Geometry Dash · Switch Port</h1>
 
-A wrapper/port of the Android release of **Geometry Dash** (
-`com.robtopx.geometryjump`). It loads the original arm64 game
-binaries — `libcocos2dcpp.so` (RobTop's cocos2d-x 2.2 fork + the game) *and*
-the stock `libfmod.so` — patches them and runs them inside a minimal
-Android-like environment natively on the Switch.
+A wrapper/port of the Android releases of **Geometry Dash**, **Meltdown**,
+**SubZero**, and **World**. It loads the original arm64 game binaries —
+`libcocos2dcpp.so` (RobTop's cocos2d-x 2.2 fork + the game) and the stock
+`libfmod.so` — patches them and runs them inside a minimal Android-like
+environment natively on the Switch.
 
 ### How to install
 
 You need a **2.2.14x arm64** Android release; extract the files from your own
 legally-owned copy of the game.
 
-Create a folder `/switch/gdash` and fill it:
+Create a separate folder for each game you install and fill it:
 
 ```
 /switch/<anything>/
@@ -25,8 +25,16 @@ Create a folder `/switch/gdash` and fill it:
   libfmod.so              # from the APK's lib/arm64-v8a/
   assets/                 # the entire contents of the APK's assets/ folder
   config.txt              # created on first run
-  save/                   # created on first run; game saves + prefs
+  prefs.txt               # created on first run; includes anonymous network ID
+  cacert.pem               # generated from the Switch firmware trust store
+  save/                    # created on first run; game saves
 ```
+
+For example, `/switch/gdash_full`, `/switch/gdash_meltdown`,
+`/switch/gdash_subzero`, and `/switch/gdash_world` each keep an independent
+save. Split APK/XAPK releases usually store the assets in the base APK and the
+native libraries in `config.arm64_v8a.apk`. An `armeabi-v7a`-only release is
+32-bit and cannot supply libraries for this arm64 port.
 
 ### Notes
 
@@ -39,6 +47,26 @@ a forwarder.
 * `screen_width` / `screen_height` — render resolution; `-1` auto-picks
   1280x720 handheld / 1920x1080 docked.
 * `cursor_speed` — pointer speed of the stick-driven cursor, px/s at 720p.
+
+### Online features
+
+Public leaderboards and level search/download use RobTop's native Boomlings HTTPS
+client embedded in `libcocos2dcpp.so`; they do not require Google Play Games.
+The port supplies the missing Switch socket ABI conversions, reports the real
+console connection state, and keeps a random anonymous network ID in
+`prefs.txt`. It does not read a Nintendo account or console identifier.
+
+TLS peer and hostname verification are enabled at load time. `cacert.pem` is
+regenerated from the Switch firmware's enabled public root certificates, so no
+certificate file needs to be copied beside the NRO. Google Play sign-in stays
+disabled. The public global leaderboard is fetched without the stock client's
+anonymous score-upload bootstrap. Level-specific leaderboards require a logged-in
+Geometry Dash account because Boomlings requires account authorization for that
+endpoint. Score submission, comments, uploads, messaging, and other social
+endpoints are outside the supported/tested scope of this port.
+
+Networking is always enabled. Release builds do not write network diagnostic
+logs or record request/response payloads, the anonymous ID, or credentials.
 
 ### How to build
 

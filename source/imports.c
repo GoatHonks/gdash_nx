@@ -190,8 +190,12 @@ static const char *fmod_fix_path(const char *name, unsigned mode, char *buf, siz
     snprintf(buf, buflen, "%s/%s", path_assets(), name + ANDROID_ASSET_URI_LEN);
     return buf;
   }
-  if (strncmp(name, ANDROID_DATA_PREFIX, sizeof(ANDROID_DATA_PREFIX) - 1) == 0) {
-    snprintf(buf, buflen, "%s/%s", path_save(), name + sizeof(ANDROID_DATA_PREFIX) - 1);
+  const char *suffix = path_android_private_suffix(name);
+  if (suffix) {
+    if (suffix[0])
+      snprintf(buf, buflen, "%s/%s", path_save(), suffix);
+    else
+      snprintf(buf, buflen, "%s", path_save());
     return buf;
   }
   return name;
@@ -478,7 +482,7 @@ DynLibFunction dynlib_functions[] = {
   { "stat", (uintptr_t)&stat_fake },
   { "fstat", (uintptr_t)&fstat_fake },
   { "lstat", (uintptr_t)&lstat_fake },
-  { "write", (uintptr_t)&write },
+  { "write", (uintptr_t)&write_fake },
   { "writev", (uintptr_t)&writev_fake },
   { "mmap", (uintptr_t)&mmap_fake },
   { "munmap", (uintptr_t)&munmap_fake },
@@ -603,8 +607,8 @@ DynLibFunction dynlib_functions[] = {
   { "getsockname", (uintptr_t)&getsockname_fake },
   { "getsockopt", (uintptr_t)&getsockopt_fake },
   { "if_nametoindex", (uintptr_t)&if_nametoindex_fake },
-  { "inet_ntop", (uintptr_t)&inet_ntop },
-  { "inet_pton", (uintptr_t)&inet_pton },
+  { "inet_ntop", (uintptr_t)&inet_ntop_fake },
+  { "inet_pton", (uintptr_t)&inet_pton_fake },
   { "listen", (uintptr_t)&listen_fake },
   { "poll", (uintptr_t)&poll_fake },
   { "recv", (uintptr_t)&recv_fake },

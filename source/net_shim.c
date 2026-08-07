@@ -9,11 +9,15 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <string.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <malloc.h>
 #include <poll.h>
 #include <netdb.h>
+#include <arpa/inet.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <sys/ioctl.h>
@@ -22,13 +26,213 @@
 #include <netinet/tcp.h>
 #include <switch.h>
 
+#include "paths.h"
+#include "prefs.h"
+#include "libc_shim.h"
 #include "net_shim.h"
 
 static int net_up = 0;
+static int nifm_up = 0;
+static int ca_ready = 0;
+static int cached_available = -1;
+static u64 availability_tick = 0;
+static Mutex availability_lock;
+static char user_id[17] = "0000000000000000";
 
-void net_init(void) {
-  if (R_SUCCEEDED(socketInitializeDefault()))
-    net_up = 1;
+static int file_nonempty(const char *path) {
+  struct stat st;
+  return stat(path, &st) == 0 && st.st_size > 0;
+}
+
+static int write_pem_certificate(FILE *f, const unsigned char *der, size_t len) {
+  static const char b64[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  if (fputs("-----BEGIN CERTIFICATE-----\n", f) < 0)
+    return -1;
+  unsigned column = 0;
+  for (size_t i = 0; i < len; i += 3) {
+    const size_t left = len - i;
+    const uint32_t v = (uint32_t)der[i] << 16 |
+                       (left > 1 ? (uint32_t)der[i + 1] << 8 : 0) |
+                       (left > 2 ? der[i + 2] : 0);
+    char out[4] = {
+      b64[(v >> 18) & 63], b64[(v >> 12) & 63],
+      left > 1 ? b64[(v >> 6) & 63] : '=',
+      left > 2 ? b64[v & 63] : '=',
+    };
+    if (fwrite(out, 1, sizeof(out), f) != sizeof(out))
+      return -1;
+    column += 4;
+    if (column == 64) {
+      if (fputc('\n', f) == EOF)
+        return -1;
+      column = 0;
+    }
+  }
+  if (column && fputc('\n', f) == EOF)
+    return -1;
+  return fputs("-----END CERTIFICATE-----\n", f) < 0 ? -1 : 0;
+}
+
+// The Android OpenSSL bundled in Geometry Dash has a build-machine CA path.
+// Export Horizon's maintained public trust store to a normal PEM file so the
+// original client can verify Boomlings without shipping a soon-stale bundle.
+static int export_firmware_ca_bundle(void) {
+  const int had_bundle = file_nonempty(path_ca_bundle());
+  Result rc = sslInitialize(1);
+  if (R_FAILED(rc))
+    return had_bundle;
+
+  u32 ids[1] = { (u32)SslCaCertificateId_All };
+  u32 size = 0, total = 0;
+  rc = sslGetCertificateBufSize(ids, 1, &size);
+  if (R_FAILED(rc) || size < sizeof(SslBuiltInCertificateInfo)) {
+    sslExit();
+    return had_bundle;
+  }
+
+  const size_t alloc_size = (size + 0xfff) & ~(size_t)0xfff;
+  void *buffer = memalign(0x1000, alloc_size);
+  if (!buffer) {
+    sslExit();
+    return had_bundle;
+  }
+  memset(buffer, 0, alloc_size);
+  rc = sslGetCertificates(buffer, size, ids, 1, &total);
+  if (R_FAILED(rc)) {
+    free(buffer);
+    sslExit();
+    return had_bundle;
+  }
+
+  char tmp[384], old[384];
+  snprintf(tmp, sizeof(tmp), "%s.tmp", path_ca_bundle());
+  snprintf(old, sizeof(old), "%s.old", path_ca_bundle());
+  remove(tmp);
+  FILE *f = fopen(tmp, "wb");
+  unsigned written = 0;
+  if (f) {
+    SslBuiltInCertificateInfo *certs = buffer;
+    for (u32 i = 0; i < total; i++) {
+      // IDs below 1000 are Nintendo-private roots. The web PKI starts at 1000.
+      if (certs[i].cert_id < 1000 ||
+          certs[i].status != SslTrustedCertStatus_EnabledTrusted ||
+          !certs[i].cert_data || certs[i].cert_size == 0)
+        continue;
+      if (write_pem_certificate(f, certs[i].cert_data,
+                                (size_t)certs[i].cert_size) != 0)
+        break;
+      written++;
+    }
+    if (fflush(f) != 0 || ferror(f))
+      written = 0;
+    if (fclose(f) != 0)
+      written = 0;
+  }
+  free(buffer);
+  sslExit();
+
+  if (!written) {
+    remove(tmp);
+    return had_bundle;
+  }
+
+  remove(old);
+  const int moved_old = rename(path_ca_bundle(), old) == 0;
+  if (rename(tmp, path_ca_bundle()) != 0) {
+    if (moved_old)
+      rename(old, path_ca_bundle());
+    remove(tmp);
+    return file_nonempty(path_ca_bundle());
+  }
+  remove(old);
+  return 1;
+}
+
+static int valid_user_id(const char *id) {
+  if (!id || strlen(id) != 16)
+    return 0;
+  int any_nonzero = 0;
+  for (unsigned i = 0; i < 16; i++) {
+    if (!isxdigit((unsigned char)id[i]))
+      return 0;
+    any_nonzero |= id[i] != '0';
+  }
+  return any_nonzero;
+}
+
+static void init_user_id(void) {
+  const char *saved = prefs_get_string("__gdash_nx_network_id", "");
+  if (valid_user_id(saved)) {
+    snprintf(user_id, sizeof(user_id), "%s", saved);
+    return;
+  }
+  unsigned char random[8];
+  randomGet(random, sizeof(random));
+  static const char hex[] = "0123456789abcdef";
+  for (unsigned i = 0; i < sizeof(random); i++) {
+    user_id[i * 2] = hex[random[i] >> 4];
+    user_id[i * 2 + 1] = hex[random[i] & 15];
+  }
+  user_id[16] = '\0';
+  if (!valid_user_id(user_id))
+    snprintf(user_id, sizeof(user_id), "6e78506f72743031"); // "nxPort01"
+  prefs_set_string("__gdash_nx_network_id", user_id);
+}
+
+int net_init(void) {
+  init_user_id();
+  ca_ready = export_firmware_ca_bundle();
+  Result rc = socketInitializeDefault();
+  if (R_FAILED(rc))
+    return 0;
+  net_up = 1;
+
+  rc = nifmInitialize(NifmServiceType_User);
+  if (R_SUCCEEDED(rc))
+    nifm_up = 1;
+  return 1;
+}
+
+void net_exit(void) {
+  if (nifm_up) {
+    nifmExit();
+    nifm_up = 0;
+  }
+  if (net_up) {
+    socketExit();
+    net_up = 0;
+  }
+}
+
+int net_is_available(void) {
+  if (!net_up)
+    return 0;
+  if (!nifm_up)
+    return 1;
+
+  mutexLock(&availability_lock);
+  const u64 now = armGetSystemTick();
+  const u64 freq = armGetSystemTickFreq();
+  if (cached_available < 0 || !availability_tick || now - availability_tick >= freq) {
+    NifmInternetConnectionType type = 0;
+    NifmInternetConnectionStatus status = 0;
+    u32 strength = 0;
+    Result rc = nifmGetInternetConnectionStatus(&type, &strength, &status);
+    cached_available = R_FAILED(rc) || status == NifmInternetConnectionStatus_Connected;
+    availability_tick = now;
+  }
+  const int available = cached_available;
+  mutexUnlock(&availability_lock);
+  return available;
+}
+
+int net_tls_ca_ready(void) {
+  return ca_ready;
+}
+
+const char *net_user_id(void) {
+  return user_id;
 }
 
 // ---------------------------------------------------------------------------
@@ -91,16 +295,56 @@ static int msg_flags_to_bsd(int flags) {
   return out;
 }
 
-// errno translation for curl's non-blocking connect state machine: the game
-// is compiled against bionic's (Linux) errno values, newlib's differ for the
-// in-progress family.
-static void fixup_connect_errno(void) {
-  switch (errno) {
-    case EINPROGRESS: errno = 115; break; // Linux EINPROGRESS
-    case EALREADY:    errno = 114; break; // Linux EALREADY
-    case EISCONN:     errno = 106; break; // Linux EISCONN
-    default: break;
+// The game is compiled against bionic's Linux errno numbers while libnx uses
+// newlib/FreeBSD numbers for most socket errors. Curl checks these values
+// directly, especially SO_ERROR after a non-blocking connect.
+int net_errno_to_linux(int value) {
+  switch (value) {
+    case EAFNOSUPPORT:   return 97;
+    case EPROTOTYPE:     return 91;
+    case ENOTSOCK:       return 88;
+    case ENOPROTOOPT:    return 92;
+#ifdef ESHUTDOWN
+    case ESHUTDOWN:      return 108;
+#endif
+    case EADDRINUSE:     return 98;
+    case ECONNABORTED:   return 103;
+    case ENETUNREACH:    return 101;
+    case ENETDOWN:       return 100;
+    case ETIMEDOUT:      return 110;
+    case EHOSTDOWN:      return 112;
+    case EHOSTUNREACH:   return 113;
+    case EINPROGRESS:    return 115;
+    case EALREADY:       return 114;
+    case EDESTADDRREQ:   return 89;
+    case EMSGSIZE:       return 90;
+    case EPROTONOSUPPORT:return 93;
+#ifdef ESOCKTNOSUPPORT
+    case ESOCKTNOSUPPORT:return 94;
+#endif
+    case EADDRNOTAVAIL:  return 99;
+    case ENETRESET:      return 102;
+    case EISCONN:        return 106;
+    case ENOTCONN:       return 107;
+    case ETOOMANYREFS:   return 109;
+    default:             return value; // common/POSIX values already match
   }
+}
+
+static void fixup_socket_errno(void) {
+  errno = net_errno_to_linux(errno);
+}
+
+static int socket_result(int result) {
+  if (result < 0)
+    fixup_socket_errno();
+  return result;
+}
+
+static long socket_result_long(long result) {
+  if (result < 0)
+    fixup_socket_errno();
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +361,8 @@ int socket_fake(int domain, int type, int protocol) {
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
   }
+  if (fd < 0)
+    fixup_socket_errno();
   return fd;
 }
 
@@ -125,19 +371,19 @@ int connect_fake(int fd, const void *addr, unsigned addrlen) {
   struct sockaddr_storage tmp;
   int r = connect(fd, sa_to_bsd(addr, addrlen, &tmp), addrlen);
   if (r < 0)
-    fixup_connect_errno();
+    fixup_socket_errno();
   return r;
 }
 
 int bind_fake(int fd, const void *addr, unsigned addrlen) {
   if (!net_up) { errno = EBADF; return -1; }
   struct sockaddr_storage tmp;
-  return bind(fd, sa_to_bsd(addr, addrlen, &tmp), addrlen);
+  return socket_result(bind(fd, sa_to_bsd(addr, addrlen, &tmp), addrlen));
 }
 
 int accept_fake(int fd, void *addr, unsigned *addrlen) {
   if (!net_up) { errno = EBADF; return -1; }
-  int r = accept(fd, (struct sockaddr *)addr, (socklen_t *)addrlen);
+  int r = socket_result(accept(fd, (struct sockaddr *)addr, (socklen_t *)addrlen));
   if (r >= 0 && addr && addrlen)
     sa_to_linux_inplace(addr, *addrlen);
   return r;
@@ -145,34 +391,37 @@ int accept_fake(int fd, void *addr, unsigned *addrlen) {
 
 int listen_fake(int fd, int backlog) {
   if (!net_up) { errno = EBADF; return -1; }
-  return listen(fd, backlog);
+  return socket_result(listen(fd, backlog));
 }
 
 int shutdown_fake(int fd, int how) {
   if (!net_up) { errno = EBADF; return -1; }
-  return shutdown(fd, how);
+  return socket_result(shutdown(fd, how));
 }
 
 long send_fake(int fd, const void *buf, size_t len, int flags) {
   if (!net_up) { errno = EBADF; return -1; }
-  return send(fd, buf, len, msg_flags_to_bsd(flags));
+  return socket_result_long(send(fd, buf, len, msg_flags_to_bsd(flags)));
 }
 
 long recv_fake(int fd, void *buf, size_t len, int flags) {
   if (!net_up) { errno = EBADF; return -1; }
-  return recv(fd, buf, len, msg_flags_to_bsd(flags));
+  return socket_result_long(recv(fd, buf, len, msg_flags_to_bsd(flags)));
 }
 
 long sendto_fake(int fd, const void *buf, size_t len, int flags, const void *addr, unsigned addrlen) {
   if (!net_up) { errno = EBADF; return -1; }
   struct sockaddr_storage tmp;
-  return sendto(fd, buf, len, msg_flags_to_bsd(flags),
-                addr ? sa_to_bsd(addr, addrlen, &tmp) : NULL, addrlen);
+  return socket_result_long(sendto(fd, buf, len, msg_flags_to_bsd(flags),
+                           addr ? sa_to_bsd(addr, addrlen, &tmp) : NULL,
+                           addrlen));
 }
 
 long recvfrom_fake(int fd, void *buf, size_t len, int flags, void *addr, unsigned *addrlen) {
   if (!net_up) { errno = EBADF; return -1; }
-  long r = recvfrom(fd, buf, len, msg_flags_to_bsd(flags), (struct sockaddr *)addr, (socklen_t *)addrlen);
+  long r = socket_result_long(recvfrom(fd, buf, len, msg_flags_to_bsd(flags),
+                                      (struct sockaddr *)addr,
+                                      (socklen_t *)addrlen));
   if (r >= 0 && addr && addrlen)
     sa_to_linux_inplace(addr, *addrlen);
   return r;
@@ -180,7 +429,8 @@ long recvfrom_fake(int fd, void *buf, size_t len, int flags, void *addr, unsigne
 
 int getsockname_fake(int fd, void *addr, unsigned *addrlen) {
   if (!net_up) { errno = EBADF; return -1; }
-  int r = getsockname(fd, (struct sockaddr *)addr, (socklen_t *)addrlen);
+  int r = socket_result(getsockname(fd, (struct sockaddr *)addr,
+                                   (socklen_t *)addrlen));
   if (r == 0 && addr && addrlen)
     sa_to_linux_inplace(addr, *addrlen);
   return r;
@@ -188,7 +438,8 @@ int getsockname_fake(int fd, void *addr, unsigned *addrlen) {
 
 int getpeername_fake(int fd, void *addr, unsigned *addrlen) {
   if (!net_up) { errno = EBADF; return -1; }
-  int r = getpeername(fd, (struct sockaddr *)addr, (socklen_t *)addrlen);
+  int r = socket_result(getpeername(fd, (struct sockaddr *)addr,
+                                   (socklen_t *)addrlen));
   if (r == 0 && addr && addrlen)
     sa_to_linux_inplace(addr, *addrlen);
   return r;
@@ -200,8 +451,13 @@ int getpeername_fake(int fd, void *addr, unsigned *addrlen) {
 static int sockopt_to_bsd(int level, int optname, int *out_level, int *out_name) {
   if (level == IPPROTO_TCP) { // 6 == 6
     *out_level = IPPROTO_TCP;
-    *out_name = optname; // TCP_NODELAY 1 == 1
-    return 0;
+    switch (optname) {
+      case 1: *out_name = TCP_NODELAY;  return 0;
+      case 4: *out_name = TCP_KEEPIDLE; return 0;
+      case 5: *out_name = TCP_KEEPINTVL;return 0;
+      case 6: *out_name = TCP_KEEPCNT;  return 0;
+      default: return -1;
+    }
   }
   if (level != LINUX_SOL_SOCKET)
     return -1;
@@ -230,7 +486,17 @@ int getsockopt_fake(int fd, int level, int optname, void *optval, unsigned *optl
       memset(optval, 0, 4);
     return 0;
   }
-  return getsockopt(fd, l, n, optval, (socklen_t *)optlen);
+  int r = getsockopt(fd, l, n, optval, (socklen_t *)optlen);
+  if (r < 0) {
+    fixup_socket_errno();
+    return r;
+  }
+  if (l == SOL_SOCKET && n == SO_ERROR && optval && optlen &&
+      *optlen >= sizeof(int)) {
+    int *error = optval;
+    *error = net_errno_to_linux(*error);
+  }
+  return r;
 }
 
 int setsockopt_fake(int fd, int level, int optname, const void *optval, unsigned optlen) {
@@ -238,20 +504,18 @@ int setsockopt_fake(int fd, int level, int optname, const void *optval, unsigned
   int l, n;
   if (sockopt_to_bsd(level, optname, &l, &n) != 0)
     return 0; // ignore unmapped options
-  return setsockopt(fd, l, n, optval, optlen);
+  return socket_result(setsockopt(fd, l, n, optval, optlen));
 }
 
-// struct addrinfo field order matches bionic (BSD-derived); only ai_flags
-// values and the embedded sockaddrs need attention. curl passes AI_NUMERICHOST
-// (Linux 4 == BSD 4) and AI_PASSIVE (1 == 1); AI_ADDRCONFIG (0x20 vs 0x400)
-// is dropped -- it is a hint only.
+// struct addrinfo and AI_* values match Android's BSD-derived bionic ABI; only
+// socket type flags, address families and the embedded sockaddr need changes.
 int getaddrinfo_fake(const char *node, const char *service, const void *hints, void **res) {
   if (!net_up)
     return EAI_FAIL;
   struct addrinfo h, *bsd_hints = NULL;
   if (hints) {
     memcpy(&h, hints, sizeof(h));
-    h.ai_flags &= (AI_PASSIVE | AI_CANONNAME | AI_NUMERICHOST);
+    h.ai_flags &= AI_MASK;
     h.ai_family = family_to_bsd((unsigned short)h.ai_family);
     h.ai_socktype &= LINUX_SOCK_TYPE_MASK;
     h.ai_addrlen = 0;
@@ -261,6 +525,8 @@ int getaddrinfo_fake(const char *node, const char *service, const void *hints, v
     bsd_hints = &h;
   }
   int r = getaddrinfo(node, service, bsd_hints, (struct addrinfo **)res);
+  if (r == EAI_SYSTEM)
+    fixup_socket_errno();
   if (r == 0 && res) {
     for (struct addrinfo *ai = *res; ai; ai = ai->ai_next) {
       ai->ai_family = family_to_linux((unsigned char)ai->ai_family);
@@ -296,19 +562,48 @@ int getnameinfo_fake(const void *sa, unsigned salen, char *host, unsigned hostle
   if (!net_up)
     return EAI_FAIL;
   struct sockaddr_storage tmp;
-  return getnameinfo(sa_to_bsd(sa, salen, &tmp), salen, host, hostlen, serv, servlen,
-                     flags & (NI_NUMERICHOST | NI_NUMERICSERV));
+  return getnameinfo(sa_to_bsd(sa, salen, &tmp), salen, host, hostlen, serv,
+                     servlen, flags);
+}
+
+const char *inet_ntop_fake(int af, const void *src, char *dst, unsigned size) {
+  return inet_ntop(family_to_bsd((unsigned short)af), src, dst, size);
+}
+
+int inet_pton_fake(int af, const char *src, void *dst) {
+  int r = inet_pton(family_to_bsd((unsigned short)af), src, dst);
+  if (r < 0)
+    fixup_socket_errno();
+  return r;
 }
 
 // struct pollfd and the POLLIN/OUT/ERR/HUP/NVAL bits match between ABIs
 int poll_fake(void *fds, unsigned nfds, int timeout) {
   if (!net_up) { errno = EINVAL; return -1; }
-  return poll((struct pollfd *)fds, nfds, timeout);
+  struct pollfd *pollfds = fds;
+  int result;
+  if (nfds == 0) {
+    // POSIX uses poll(NULL, 0, timeout) as a millisecond sleep. The BSD
+    // service rejects the null array with EFAULT, so perform that sleep here.
+    if (timeout > 0)
+      svcSleepThread((s64)timeout * 1000000ll);
+    result = 0;
+  } else if (nfds == 1 && pollfds && is_urandom_fd_fake(pollfds[0].fd)) {
+    // OpenSSL polls /dev/urandom once before its first entropy read. Its fd is
+    // virtual in this port, so forwarding it to BSD produces EBADF and aborts
+    // TLS before certificate setup. Horizon's randomGet is always readable.
+    pollfds[0].revents = pollfds[0].events & (POLLIN | POLLRDNORM);
+    result = pollfds[0].revents ? 1 : 0;
+  } else {
+    result = socket_result(poll(pollfds, nfds, timeout));
+  }
+  return result;
 }
 
 int select_fake(int nfds, void *rd, void *wr, void *ex, void *tv) {
   if (!net_up) { errno = EINVAL; return -1; }
-  return select(nfds, (fd_set *)rd, (fd_set *)wr, (fd_set *)ex, (struct timeval *)tv);
+  return socket_result(select(nfds, (fd_set *)rd, (fd_set *)wr,
+                              (fd_set *)ex, (struct timeval *)tv));
 }
 
 // fcntl: F_GETFL/F_SETFL match (3/4); O_NONBLOCK is 0x800 on bionic vs
@@ -316,13 +611,16 @@ int select_fake(int nfds, void *rd, void *wr, void *ex, void *tv) {
 #define LINUX_O_NONBLOCK 0x800
 
 int fcntl_fake(int fd, int cmd, ...) {
-  va_list va;
-  va_start(va, cmd);
-  long arg = va_arg(va, long);
-  va_end(va);
+  long arg = 0;
+  if (cmd == F_SETFL || cmd == 2) {
+    va_list va;
+    va_start(va, cmd);
+    arg = va_arg(va, long);
+    va_end(va);
+  }
   switch (cmd) {
     case F_GETFL: {
-      int fl = fcntl(fd, F_GETFL, 0);
+      int fl = socket_result(fcntl(fd, F_GETFL, 0));
       if (fl < 0) return fl;
       int out = fl & 3;
       if (fl & O_NONBLOCK) out |= LINUX_O_NONBLOCK;
@@ -331,7 +629,7 @@ int fcntl_fake(int fd, int cmd, ...) {
     case F_SETFL: {
       int fl = 0;
       if (arg & LINUX_O_NONBLOCK) fl |= O_NONBLOCK;
-      return fcntl(fd, F_SETFL, fl);
+      return socket_result(fcntl(fd, F_SETFL, fl));
     }
     case 1: // F_GETFD
       return 0;
@@ -352,9 +650,9 @@ int ioctl_fake(int fd, unsigned long request, ...) {
   va_end(va);
   switch (request) {
     case LINUX_FIONBIO:
-      return ioctl(fd, FIONBIO, arg);
+      return socket_result(ioctl(fd, FIONBIO, arg));
     case LINUX_FIONREAD:
-      return ioctl(fd, FIONREAD, arg);
+      return socket_result(ioctl(fd, FIONREAD, arg));
     default:
       return 0;
   }
@@ -362,13 +660,13 @@ int ioctl_fake(int fd, unsigned long request, ...) {
 
 int pipe_fake(int fds[2]) {
   (void)fds;
-  errno = ENOSYS;
+  errno = 38; // bionic/Linux ENOSYS (newlib uses 88)
   return -1;
 }
 
 int socketpair_fake(int domain, int type, int protocol, int sv[2]) {
   (void)domain; (void)type; (void)protocol; (void)sv;
-  errno = ENOSYS;
+  errno = 38;
   return -1;
 }
 
@@ -383,12 +681,11 @@ unsigned if_nametoindex_fake(const char *ifname) {
 }
 
 const char *gai_strerror_fake(int ecode) {
-  (void)ecode;
-  return "getaddrinfo error";
+  return gai_strerror(ecode);
 }
 
 int dup2_fake(int oldfd, int newfd) {
   (void)oldfd; (void)newfd;
-  errno = ENOSYS;
+  errno = 38;
   return -1;
 }

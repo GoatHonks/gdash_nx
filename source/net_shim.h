@@ -15,8 +15,15 @@
 
 #include <stddef.h>
 
-// call once at startup (before the game runs) to bring up the socket layer
-void net_init(void);
+// Call once after paths/config/preferences are initialized. Besides bringing
+// up BSD sockets, this exports Horizon's trusted public roots for the game's
+// embedded OpenSSL and creates a stable anonymous Android-style device ID.
+int net_init(void);
+void net_exit(void);
+int net_is_available(void);
+int net_tls_ca_ready(void);
+const char *net_user_id(void);
+int net_errno_to_linux(int value);
 
 int socket_fake(int domain, int type, int protocol);
 int connect_fake(int fd, const void *addr, unsigned addrlen);
@@ -37,6 +44,8 @@ void freeaddrinfo_fake(void *res);
 void *gethostbyname_fake(const char *name);
 int getnameinfo_fake(const void *sa, unsigned salen, char *host, unsigned hostlen,
                      char *serv, unsigned servlen, int flags);
+const char *inet_ntop_fake(int af, const void *src, char *dst, unsigned size);
+int inet_pton_fake(int af, const char *src, void *dst);
 int poll_fake(void *fds, unsigned nfds, int timeout);
 int select_fake(int nfds, void *rd, void *wr, void *ex, void *tv);
 int fcntl_fake(int fd, int cmd, ...);

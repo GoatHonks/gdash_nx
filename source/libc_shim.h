@@ -67,7 +67,9 @@ int sigprocmask_fake(int how, const void *set, void *oset);
 // fs (all remap android-absolute paths through fix_path)
 int open_fake(const char *path, int flags, ...);
 int open2_fake(const char *path, int flags); // bionic __open_2
-int read_fake(int fd, void *buf, size_t count);
+int is_urandom_fd_fake(int fd);
+long read_fake(int fd, void *buf, size_t count);
+long write_fake(int fd, const void *buf, size_t count);
 int close_fake(int fd);
 int access_fake(const char *path, int mode);
 int chmod_fake(const char *path, unsigned mode);

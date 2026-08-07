@@ -45,6 +45,7 @@ struct iovec {
 #include "so_util.h"
 #include "libc_shim.h"
 #include "pthr.h"
+#include "net_shim.h"
 
 // ---------------------------------------------------------------------------
 // fortify (_chk) wrappers: ignore the object-size argument
@@ -202,16 +203,18 @@ long sysconf_fake(int name) {
   }
 }
 
-// High-resolution clock for all clock ids, backed by the 19.2 MHz system tick
-// (newlib's CLOCK_REALTIME here is RTC-backed with 1 s granularity, useless
-// for frame timing). A fixed epoch base keeps tv_sec plausible for absolute-
-// time consumers; it cancels out of the deltas the game computes.
+// High-resolution monotonic clocks use the 19.2 MHz system tick. Real-time
+// IDs must use the console RTC: OpenSSL uses wall-clock time when validating
+// certificate validity periods. Bionic's IDs differ from newlib's (Android
+// CLOCK_REALTIME is 0; newlib CLOCK_REALTIME is 1).
 #define FAKE_EPOCH_BASE 1700000000ull // ~2023-11, seconds
 
 int clock_gettime_fake(int clk_id, struct timespec *tp) {
-  (void)clk_id;
   if (!tp)
     return -1;
+  // Android CLOCK_REALTIME / REALTIME_COARSE / REALTIME_ALARM.
+  if (clk_id == 0 || clk_id == 5 || clk_id == 8)
+    return clock_gettime(CLOCK_REALTIME, tp);
   static u64 freq = 0;
   if (!freq)
     freq = armGetSystemTickFreq(); // 19200000 on the Switch
@@ -305,8 +308,8 @@ int sigprocmask_fake(int how, const void *set, void *oset) {
 }
 
 // ---------------------------------------------------------------------------
-// path remapping: the game hardcodes its Android data dir in a few places
-// (song/save paths built before the JNI writable path is queried)
+// path remapping: every GD variant hardcodes a different Android package dir
+// in a few places (song/save paths built before JNI's writable path is queried)
 // ---------------------------------------------------------------------------
 
 const char *fix_path(const char *path) {
@@ -314,10 +317,31 @@ const char *fix_path(const char *path) {
   static unsigned rr = 0;
   if (!path)
     return path;
-  if (strncmp(path, ANDROID_DATA_PREFIX, sizeof(ANDROID_DATA_PREFIX) - 1) == 0) {
+
+  // OpenSSL 1.1.0c in the Android library was built on a developer Mac and
+  // retained that machine's absolute OPENSSLDIR. net_init() exports the
+  // Switch firmware's current trusted public roots here instead.
+  static const char *ca_suffixes[] = {
+    "/ssl/cert.pem",
+    "/ssl/certs/ca-certificates.crt",
+    "/etc/ssl/cert.pem",
+    "/etc/ssl/certs/ca-certificates.crt",
+  };
+  const size_t path_len = strlen(path);
+  for (unsigned i = 0; i < sizeof(ca_suffixes) / sizeof(*ca_suffixes); i++) {
+    const size_t suffix_len = strlen(ca_suffixes[i]);
+    if (path_len >= suffix_len &&
+        strcmp(path + path_len - suffix_len, ca_suffixes[i]) == 0)
+      return path_ca_bundle();
+  }
+
+  const char *suffix = path_android_private_suffix(path);
+  if (suffix) {
     char *out = bufs[rr++ & 3];
-    snprintf(out, sizeof(bufs[0]), "%s/%s", path_save(),
-             path + sizeof(ANDROID_DATA_PREFIX) - 1);
+    if (suffix[0])
+      snprintf(out, sizeof(bufs[0]), "%s/%s", path_save(), suffix);
+    else
+      snprintf(out, sizeof(bufs[0]), "%s", path_save());
     return out;
   }
   return path;
@@ -330,7 +354,7 @@ const char *fix_path(const char *path) {
 
 #define URANDOM_FD_BASE 0x7f000000
 
-static int is_urandom_fd(int fd) {
+int is_urandom_fd_fake(int fd) {
   return fd >= URANDOM_FD_BASE && fd < URANDOM_FD_BASE + 16;
 }
 
@@ -369,28 +393,43 @@ int open_fake(const char *path, int flags, ...) {
     mode = va_arg(va, int);
     va_end(va);
   }
-  return open(fix_path(path), convert_open_flags(flags), mode);
+  const char *p = fix_path(path);
+  return open(p, convert_open_flags(flags), mode);
 }
 
 // bionic's fortified open with no variadic mode (read/existing files)
 int open2_fake(const char *path, int flags) {
   if (is_urandom_path(path))
     return URANDOM_FD_BASE;
-  return open(fix_path(path), convert_open_flags(flags), 0666);
+  const char *p = fix_path(path);
+  return open(p, convert_open_flags(flags), 0666);
 }
 
-int read_fake(int fd, void *buf, size_t count) {
-  if (is_urandom_fd(fd)) {
+long read_fake(int fd, void *buf, size_t count) {
+  if (is_urandom_fd_fake(fd)) {
     randomGet(buf, count); // kernel-entropy chacha, no service needed
-    return (int)count;
+    return (long)count;
   }
-  return read(fd, buf, count);
+  long result = read(fd, buf, count);
+  if (result < 0)
+    errno = net_errno_to_linux(errno);
+  return result;
+}
+
+long write_fake(int fd, const void *buf, size_t count) {
+  long result = write(fd, buf, count);
+  if (result < 0)
+    errno = net_errno_to_linux(errno);
+  return result;
 }
 
 int close_fake(int fd) {
-  if (is_urandom_fd(fd))
+  if (is_urandom_fd_fake(fd))
     return 0;
-  return close(fd);
+  int result = close(fd);
+  if (result < 0)
+    errno = net_errno_to_linux(errno);
+  return result;
 }
 
 int access_fake(const char *path, int mode) {
@@ -497,7 +536,7 @@ int stat_fake(const char *path, struct bionic_stat *st) {
 }
 
 int fstat_fake(int fd, struct bionic_stat *st) {
-  if (is_urandom_fd(fd)) {
+  if (is_urandom_fd_fake(fd)) {
     // OpenSSL checks S_ISCHR on the random device
     memset(st, 0, sizeof(*st));
     st->st_mode = S_IFCHR | 0444;
@@ -689,7 +728,7 @@ long writev_fake(int fd, const struct iovec *iov, int iovcnt) {
   for (int i = 0; i < iovcnt; i++) {
     if (iov[i].iov_len == 0)
       continue;
-    ssize_t w = write(fd, iov[i].iov_base, iov[i].iov_len);
+    long w = write_fake(fd, iov[i].iov_base, iov[i].iov_len);
     if (w < 0)
       return total > 0 ? total : -1;
     total += w;

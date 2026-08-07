@@ -12,7 +12,8 @@
 #include "paths.h"
 
 static char s_base[256], s_assets[288], s_assets_slash[288], s_save[288], s_prefs[288];
-static char s_config[288], s_so_game[288], s_so_fmod[288];
+static char s_config[288], s_ca_bundle[288];
+static char s_so_game[288], s_so_fmod[288];
 
 // strip a "device:" prefix and the trailing "/<file>" component
 static void dir_of(const char *in, char *out, size_t n) {
@@ -46,6 +47,7 @@ void paths_init(const char *argv0) {
   snprintf(s_save,         sizeof s_save,         "%s/save", s_base);
   snprintf(s_prefs,        sizeof s_prefs,        "%s/prefs.txt", s_base);
   snprintf(s_config,       sizeof s_config,       "%s/%s", s_base, CONFIG_NAME);
+  snprintf(s_ca_bundle,    sizeof s_ca_bundle,    "%s/cacert.pem", s_base);
   snprintf(s_so_game,      sizeof s_so_game,      "%s/%s", s_base, SO_NAME);
   snprintf(s_so_fmod,      sizeof s_so_fmod,      "%s/%s", s_base, FMOD_SO_NAME);
 }
@@ -56,5 +58,31 @@ const char *path_assets_search(void) { return s_assets_slash; }
 const char *path_save(void)          { return s_save; }
 const char *path_prefs(void)         { return s_prefs; }
 const char *path_config(void)        { return s_config; }
+const char *path_ca_bundle(void)     { return s_ca_bundle; }
 const char *path_so_game(void)       { return s_so_game; }
 const char *path_so_fmod(void)       { return s_so_fmod; }
+
+const char *path_android_private_suffix(const char *path) {
+  static const char *roots[] = {
+    "/data/data/",
+    "/data/user/0/",
+    "/data/user_de/0/",
+  };
+  if (!path)
+    return NULL;
+  for (unsigned i = 0; i < sizeof(roots) / sizeof(*roots); i++) {
+    const size_t root_len = strlen(roots[i]);
+    if (strncmp(path, roots[i], root_len) != 0)
+      continue;
+    const char *package = path + root_len;
+    if (!package[0] || package[0] == '/')
+      return NULL;
+    const char *suffix = strchr(package, '/');
+    if (!suffix)
+      return package + strlen(package);
+    while (*suffix == '/')
+      suffix++;
+    return suffix;
+  }
+  return NULL;
+}
