@@ -13,8 +13,8 @@ Meltdown, SubZero and World stuttered even with everything above applied. Two
 separate causes, which multiplied each other.
 
 **The icon split must not be run on the card.** `split_icons.py` moves files
-with a rename, which on exFAT relocates each file's directory entry but never
-rewrites its data. Doing that to 4800 files leaves the new bucket directories
+with a rename, which on the card's filesystem — FAT32 or exFAT, both behave the
+same way — relocates each file's directory entry but never rewrites its data. Doing that to 4800 files leaves the new bucket directories
 scattered across the card with every file's data still where it originally sat.
 Reaching a 2.9 KB icon then cost more than reading an 87 KB file from the root
 directory — 143 ms against 14 ms, the opposite of what size or file count would

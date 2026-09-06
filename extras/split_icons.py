@@ -19,10 +19,11 @@ startup rather than recomputing this hash.
 
 IMPORTANT -- do not run this directly on the SD card.
 
-This script moves files with a rename. On the card's exFAT that relocates each
-file directory ENTRY but never rewrites its data, so 4800 renames leave the new
-bucket directories scattered across the card with every file data still wherever
-it originally landed. Measured on hardware, that is worse than not splitting:
+This script moves files with a rename. On the card's filesystem -- FAT32 or
+exFAT, both behave this way -- that relocates each file's directory ENTRY but
+never rewrites its data. So 4800 renames leave the new bucket directories
+scattered across the card with every file's data still wherever it originally
+landed. Measured on hardware (FAT32), that is worse than not splitting at all:
 
                         split in place    copied fresh
     index build         1624 ms            156 ms
