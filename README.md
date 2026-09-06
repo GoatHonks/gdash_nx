@@ -19,11 +19,11 @@ stutter, save and control fixes. **All credit for the port itself goes to
 NaGaa95**, and to Andy Nguyen and fgsfds, whose loader it is built on.
 Everything below this section is NaGaa95's README.
 
-I am not a developer and know very little programming. Every code change here
-was written by [Claude Code](https://claude.com/claude-code); my part was
-describing the problems I hit, testing builds on my Switch, and reporting back.
-The fixes were arrived at by measuring on real hardware, but they have had far
-less review than upstream code — treat them accordingly.
+I am not a developer and know very little programming. The changes here were made
+entirely with [Claude Code](https://claude.com/claude-code). My part was describing
+the problems I ran into while playing and testing the results on hardware. The
+reasoning behind each change is in [CHANGELOG.md](CHANGELOG.md) so anyone can check
+it, and the code comments explain what was measured and why.
 
 **What this fork changes:**
 
