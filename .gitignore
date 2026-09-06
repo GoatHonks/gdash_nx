@@ -14,3 +14,4 @@ prefs.txt
 config.txt
 cacert.pem
 gdash_nx_port/
+gdash_*_port/

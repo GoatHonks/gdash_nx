@@ -33,7 +33,12 @@ static Mutex g_lock;
 #define UNLOCK() ((void)0)
 #endif
 
-#define SLOTS       8192u  // power of two; the tree holds ~5800 cacheable files
+// Sized for headroom, not for one game. Geometry Dash, Meltdown, SubZero and
+// World all ship ~5800 cacheable files at 89-95 MB, so a table or budget fitted
+// to any one of them leaves the others on a knife edge -- and when the budget
+// runs out mid-fill, the files that miss out are whichever the prefetcher
+// reached last, i.e. the root sprite sheets the menus use constantly.
+#define SLOTS       16384u // load factor ~0.35 rather than ~0.71
 #define MAX_FILE    (16u * 1024u * 1024u)
 
 typedef struct {

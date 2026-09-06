@@ -7,6 +7,51 @@ game assets are modified or redistributed — you still supply your own.
 
 ---
 
+## r2 — the other three games
+
+Meltdown, SubZero and World stuttered even with everything above applied. Two
+separate causes, which multiplied each other.
+
+**The icon split must not be run on the card.** `split_icons.py` moves files
+with a rename, which on exFAT relocates each file's directory entry but never
+rewrites its data. Doing that to 4800 files leaves the new bucket directories
+scattered across the card with every file's data still where it originally sat.
+Reaching a 2.9 KB icon then cost more than reading an 87 KB file from the root
+directory — 143 ms against 14 ms, the opposite of what size or file count would
+predict. Copying the split tree onto the card fresh writes directories and data
+down together:
+
+| | split in place | copied fresh |
+|---|---|---|
+| index build | 1624 ms | **156 ms** |
+| prefetch average read | 149 ms | **7 ms** |
+| icon open | 143 ms | **7.7 ms** |
+
+The script now refuses to let anyone repeat this quietly: the warning is in its
+docstring and printed after every split.
+
+**The prefetcher's throttle was wrong.** It slept a fixed 3 ms between files,
+tuned on a folder where reads cost ~15 ms. On a folder where a read costs
+150 ms, a 3 ms gap means the thread owns the card continuously — the render
+thread's own opens then queue behind it and inflate to match. Measured: opens
+went from 19 ms to 185 ms the moment it started, and a *three-file* directory
+cost 149 ms.
+
+The gap is now proportional to the work just done — sleep 3x the read time, so
+it uses at most ~25% of the device however slow that device is — and if the
+rolling average read stays above 25 ms it stops entirely, because prefetching
+cannot pay for the contention it causes on such a card. That alone took
+in-level play from constant stalls to 1.9/min at 28 ms while still fragmented.
+
+**Also:** the asset cache budget was 96 MB, sized to Geometry Dash's 89 MB of
+assets. The other three need 94-95 MB, which is not a margin. It is now 256 MB,
+and the cache table went from 8192 to 16384 slots (load factor 0.71 to 0.35).
+
+All four games now measure the same: index build 175-185 ms, average read
+7-8 ms, and the prefetcher completing normally rather than giving up.
+
+---
+
 ## Performance: the periodic stutter
 
 The port stuttered every few seconds, badly enough to lose a run. It turned out

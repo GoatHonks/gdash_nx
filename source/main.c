@@ -719,8 +719,11 @@ int main(int argc, char **argv) {
   check_syscalls();
   check_data();
   asset_index_build(path_assets()); // one directory walk now, none per frame
-  // 89 MB holds every non-audio asset; the heap here is well over 1 GB
-  asset_cache_init(path_assets(), 96u * 1024u * 1024u);
+  // 256 MB: the four supported games need 89-95 MB of non-audio assets, plus
+  // allocator overhead and the stored paths. The heap here is well over 1 GB,
+  // so there is no reason to sail this close to the limit -- an exhausted
+  // budget silently stops caching and the stutter comes back.
+  asset_cache_init(path_assets(), 256u * 1024u * 1024u);
   game_compat_detect_package(path_so_game());
   set_screen_size(config.screen_width, config.screen_height);
 

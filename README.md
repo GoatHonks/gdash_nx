@@ -35,6 +35,9 @@ it, and the code comments explain what was measured and why.
 * **Menu buttons no longer press random things** ([#7](https://github.com/NaGaa95/gdash_nx/issues/7)).
 * **Saves persist** when you leave a level or close the game.
 * **Controls are configurable**, including which buttons do what.
+* **All four games** (Geometry Dash, Meltdown, SubZero, World) measure the same
+  now — the other three needed a bigger asset cache and a prefetcher that backs
+  off on a slow card.
 
 Full detail in **[CHANGELOG.md](CHANGELOG.md)**.
 

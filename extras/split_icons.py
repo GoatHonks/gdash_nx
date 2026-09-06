@@ -17,6 +17,21 @@ from "icons/foo.png" to wherever foo.png actually lives, so the game is
 unaware. Bucket names are arbitrary -- the port reads the real layout at
 startup rather than recomputing this hash.
 
+IMPORTANT -- do not run this directly on the SD card.
+
+This script moves files with a rename. On the card's exFAT that relocates each
+file directory ENTRY but never rewrites its data, so 4800 renames leave the new
+bucket directories scattered across the card with every file data still wherever
+it originally landed. Measured on hardware, that is worse than not splitting:
+
+                        split in place    copied fresh
+    index build         1624 ms            156 ms
+    icon open            143 ms            7.7 ms
+
+Instead: copy the game folder to a PC, run this on the copy, then delete
+assets/icons/ on the card and copy the split folder back. Writing the tree fresh
+lays the directories and the file data down together.
+
 Usage:
     python3 split_icons.py <path-to-assets/icons>          # split
     python3 split_icons.py <path-to-assets/icons> --undo   # flatten again
@@ -82,3 +97,7 @@ if __name__ == "__main__":
         undo(target)
     else:
         split(target)
+        print("")
+        print("NOTE: if you ran this directly on the SD card, the result will be")
+        print("      SLOWER than not splitting at all. Delete assets/icons/ on")
+        print("      the card and copy this split folder back onto it fresh.")

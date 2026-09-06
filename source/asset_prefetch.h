@@ -13,4 +13,8 @@ void asset_prefetch_stop(void);
 
 void asset_prefetch_stats(unsigned *done, unsigned *skipped, int *finished);
 
+// 1 once the thread backed off because reads were too slow to be worth it
+int asset_prefetch_gave_up(void);
+unsigned asset_prefetch_avg_ms(void);
+
 #endif
