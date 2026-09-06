@@ -34,6 +34,9 @@
 #include <sys/stat.h>
 #include <switch.h>
 
+#include "asset_index.h"
+#include "asset_cache.h"
+
 // no <sys/uio.h> in devkitA64 newlib; bionic's iovec layout
 struct iovec {
   void *iov_base;
@@ -383,6 +386,15 @@ static int convert_open_flags(int flags) {
   return out;
 }
 
+// The path to actually use: as written if it is there, its real location if
+// it has been moved into a bucket subdirectory, or NULL if it is genuinely
+// absent. NULL from the index means "known absent", never "unsure".
+static const char *resolve_asset(const char *p) {
+  if (!asset_index_missing(p))
+    return p;
+  return asset_index_resolve(p);
+}
+
 int open_fake(const char *path, int flags, ...) {
   if (is_urandom_path(path))
     return URANDOM_FD_BASE;
@@ -394,6 +406,13 @@ int open_fake(const char *path, int flags, ...) {
     va_end(va);
   }
   const char *p = fix_path(path);
+  if (!(flags & LINUX_O_CREAT)) {
+    p = resolve_asset(p);
+    if (!p) {
+      errno = ENOENT;
+      return -1;
+    }
+  }
   return open(p, convert_open_flags(flags), mode);
 }
 
@@ -402,6 +421,11 @@ int open2_fake(const char *path, int flags) {
   if (is_urandom_path(path))
     return URANDOM_FD_BASE;
   const char *p = fix_path(path);
+  p = resolve_asset(p);
+  if (!p) {
+    errno = ENOENT;
+    return -1;
+  }
   return open(p, convert_open_flags(flags), 0666);
 }
 
@@ -435,7 +459,12 @@ int close_fake(int fd) {
 int access_fake(const char *path, int mode) {
   (void)mode;
   struct stat st;
-  return stat(fix_path(path), &st);
+  const char *p = resolve_asset(fix_path(path));
+  if (!p) {
+    errno = ENOENT;
+    return -1;
+  }
+  return stat(p, &st);
 }
 
 int chmod_fake(const char *path, unsigned mode) {
@@ -473,6 +502,12 @@ int rename_fake(const char *from, const char *to) {
   // whereas POSIX rename() atomically replaces it. The game saves via
   // write-then-rename; without clearing the target every save after the
   // first would silently fail. remove() gives POSIX semantics.
+  //
+  // Try the rename first, though: when the destination does not exist (the
+  // first save, and every .bak rotation) the unconditional remove() was a
+  // second blocking FS IPC per file for nothing.
+  if (rename(f, t) == 0)
+    return 0;
   remove(t);
   return rename(f, t);
 }
@@ -529,7 +564,12 @@ static void convert_stat(const struct stat *in, struct bionic_stat *out) {
 
 int stat_fake(const char *path, struct bionic_stat *st) {
   struct stat real;
-  const int ret = stat(fix_path(path), &real);
+  const char *p = resolve_asset(fix_path(path));
+  if (!p) {
+    errno = ENOENT;
+    return -1;
+  }
+  const int ret = stat(p, &real);
   if (ret == 0)
     convert_stat(&real, st);
   return ret;
@@ -776,10 +816,30 @@ FILE *fopen_fake(const char *path, const char *mode) {
   if (is_urandom_path(path))
     path = "/dev/urandom"; // no FILE-level RNG consumer known; fall through
   const char *p = fix_path(path);
+  // a read-mode miss inside assets/ is answered from the index: no linear
+  // directory scan, no FS IPC, no multi-ms stall on the render thread
+  if (mode && mode[0] == 0x72) {
+    p = resolve_asset(p);
+    if (!p) {
+      errno = ENOENT;
+      return NULL;
+    }
+  }
+  // 91% of this game's asset opens are files it has already opened; serve
+  // those from RAM instead of paying another 60-170 ms filesystem open
+  if (mode && mode[0] == 0x72) {
+    FILE *cf = asset_cache_open(p);
+    if (cf)
+      return cf;
+  }
   FILE *f = fopen(p, mode);
-  if (f && strchr(mode, 'r')) {
+  if (f) {
     // the .apk archive is streamed with many small reads through the game's
-    // minizip; buffer it hard. Same for the big level/save .dat files.
+    // minizip; buffer it hard. Same for the big level/save .dat files, in
+    // BOTH directions: a save opened "w" otherwise falls back to newlib's
+    // 1 KB BUFSIZ, turning one multi-megabyte save into thousands of
+    // blocking FS IPCs to the SD card -- a visible hitch on the render
+    // thread, which is where the periodic autosave in main() runs.
     const char *ext = strrchr(p, '.');
     if (ext && (strcasecmp(ext, ".apk") == 0 || strcasecmp(ext, ".dat") == 0))
       setvbuf(f, NULL, _IOFBF, 256 * 1024);

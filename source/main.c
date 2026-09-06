@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -39,6 +40,9 @@
 #include "pthr.h"
 #include "net_shim.h"
 #include "prefs.h"
+#include "asset_index.h"
+#include "asset_cache.h"
+#include "asset_prefetch.h"
 
 static void *heap_so_base = NULL;
 static size_t heap_so_limit = 0;
@@ -47,6 +51,28 @@ so_module fmod_mod; // libfmod.so   (loaded first: exports feed the game)
 so_module game_mod; // libcocos2dcpp.so
 
 static volatile int g_quit = 0;
+
+// Set whenever the player actually does something. The periodic autosave
+// costs ~253 ms on the render thread (it serialises ~1 MB of game state), and
+// sitting on the menu changes nothing worth writing, so skip it when clean.
+// Focus-loss and quit still save unconditionally -- those are the ones that
+// protect data.
+static volatile int g_state_dirty = 0;
+static unsigned g_saves_done = 0, g_saves_skipped = 0;
+
+// Last moment the player did ANYTHING -- a touch down/up/move, or simply
+// holding a button. The autosave freezes the render thread for ~266 ms, which
+// loses a run outright, so it may only fire after a long stretch of complete
+// input silence. In a level you are always either tapping or holding, so that
+// stretch never arrives; on a menu it arrives seconds after you stop.
+static u64 g_last_input_tick;
+static u64 g_last_save_tick;
+static volatile int g_back_pending; // a BACK press is waiting to be persisted
+#define SAVE_IDLE_SECONDS 5
+#define SAVE_BACK_COOLDOWN 10 // seconds between BACK-triggered saves
+
+// Configurable button masks (config.txt: jump_buttons / back_buttons).
+static u64 g_click_mask, g_left_mask, g_right_mask, g_back_mask;
 
 // ---------------------------------------------------------------------------
 // heap split: newlib heap + .so load region (verbatim from the lbbg port)
@@ -326,14 +352,65 @@ static PadState pad;
 
 // virtual pointer ids
 enum {
-  VPTR_JUMP   = 20, // A/ZR/R -> tap (jump / menu select at bottom-right)
-  VPTR_LEFT   = 21, // dpad/stick left  -> platformer left arrow zone
-  VPTR_RIGHT  = 22, // dpad/stick right -> platformer right arrow zone
-  VPTR_CURSOR = 23, // A press at the stick-driven cursor (menu select)
+  VPTR_CLICK  = 20, // click buttons -> tap at the cursor (or click_zone)
+  VPTR_LEFT   = 21, // platformer left arrow zone  (fixed screen position)
+  VPTR_RIGHT  = 22, // platformer right arrow zone (fixed screen position)
 };
 
 // Android keycodes
 #define AKEY_BACK 4
+
+// Parse a comma-separated button list from config.txt into a HidNpadButton
+// mask. Unknown names are ignored; an empty result falls back to the default.
+static u64 parse_buttons(const char *list) {
+  static const struct { const char *name; u64 bit; } tbl[] = {
+    { "A", HidNpadButton_A },         { "B", HidNpadButton_B },
+    { "X", HidNpadButton_X },         { "Y", HidNpadButton_Y },
+    { "L", HidNpadButton_L },         { "R", HidNpadButton_R },
+    { "ZL", HidNpadButton_ZL },       { "ZR", HidNpadButton_ZR },
+    { "Plus", HidNpadButton_Plus },   { "Minus", HidNpadButton_Minus },
+    { "Up", HidNpadButton_Up },       { "Down", HidNpadButton_Down },
+    { "Left", HidNpadButton_Left },   { "Right", HidNpadButton_Right },
+    { "LStick", HidNpadButton_StickL },{ "RStick", HidNpadButton_StickR },
+  };
+  u64 mask = 0;
+  for (const char *p = list ? list : ""; *p; ) {
+    while (*p == ',' || *p == ' ') p++;
+    const char *start = p;
+    while (*p && *p != ',' && *p != ' ') p++;
+    const size_t len = (size_t)(p - start);
+    if (!len) continue;
+    for (unsigned i = 0; i < sizeof(tbl) / sizeof(*tbl); i++) {
+      if (strlen(tbl[i].name) == len && strncasecmp(start, tbl[i].name, len) == 0) {
+        mask |= tbl[i].bit;
+        break;
+      }
+    }
+  }
+  return mask;
+}
+
+// Resolve a configured list. An explicit "none" (or an empty value) disables
+// the control; a list that parses to nothing falls back to `dflt`, so a typo
+// cannot silently leave the player without a control.
+static u64 buttons_or_default(const char *list, u64 dflt) {
+  if (!list)
+    return dflt;
+  const char *p = list;
+  while (*p == ' ')
+    p++;
+  if (!*p)
+    return 0;
+  if (strncasecmp(p, "none", 4) == 0) {
+    const char *q = p + 4;
+    while (*q == ' ')
+      q++;
+    if (!*q)
+      return 0;
+  }
+  const u64 m = parse_buttons(list);
+  return m ? m : dflt;
+}
 
 // stick-driven cursor for menu navigation (essential when docked)
 static float cursor_x, cursor_y;
@@ -374,6 +451,48 @@ static void draw_rect(int x, int y, int w, int h, float r, float g, float b) {
   glScissor(x, y, w, h);
   glClearColor(r, g, b, 1.0f);
   glClear(GL_COLOR_BUFFER_BIT);
+}
+
+// A configured zone percentage (0-100) as a pixel coordinate, clamped so a
+// bad value in config.txt cannot put the tap off-screen.
+static float zone_px(int percent, float extent) {
+  if (percent < 0) percent = 0;
+  if (percent > 100) percent = 100;
+  float v = (float)percent * 0.01f * extent;
+  if (v > extent - 1.0f) v = extent - 1.0f;
+  return v;
+}
+
+// show_zones: mark where the arrow taps land, so they can be lined up with
+// the game's own arrows without guessing. Left is drawn darker than right.
+static void zones_render(void) {
+  if (!config.show_zones)
+    return;
+  GLboolean had_scissor = glIsEnabled(GL_SCISSOR_TEST);
+  GLint old_box[4];
+  GLfloat old_clear[4];
+  glGetIntegerv(GL_SCISSOR_BOX, old_box);
+  glGetFloatv(GL_COLOR_CLEAR_VALUE, old_clear);
+  glEnable(GL_SCISSOR_TEST);
+
+  const int s = screen_height / 45; // roughly 16 px at 720p
+  const struct { int x, y; float r, g, b; } marks[] = {
+    { config.left_zone_x,  config.left_zone_y,  1.0f, 0.35f, 0.0f }, // orange
+    { config.right_zone_x, config.right_zone_y, 0.0f, 0.8f,  1.0f }, // blue
+    { config.click_zone_x, config.click_zone_y, 0.2f, 1.0f,  0.3f }, // green
+  };
+  for (unsigned i = 0; i < sizeof(marks) / sizeof(*marks); i++) {
+    const int cx = (int)zone_px(marks[i].x, (float)screen_width);
+    // GL window coords are bottom-left based; the zone y is top-left based
+    const int cy = screen_height - 1 - (int)zone_px(marks[i].y, (float)screen_height);
+    draw_rect(cx - s / 2 - 1, cy - s / 2 - 1, s + 2, s + 2, 0.f, 0.f, 0.f);
+    draw_rect(cx - s / 2, cy - s / 2, s, s, marks[i].r, marks[i].g, marks[i].b);
+  }
+
+  glScissor(old_box[0], old_box[1], old_box[2], old_box[3]);
+  glClearColor(old_clear[0], old_clear[1], old_clear[2], old_clear[3]);
+  if (!had_scissor)
+    glDisable(GL_SCISSOR_TEST);
 }
 
 static void cursor_render(void) {
@@ -419,35 +538,44 @@ static void build_virtual_pointers(void) {
   const u64 down = padGetButtons(&pad);
   const float w = (float)screen_width, h = (float)screen_height;
 
-  // jump: tap near the bottom-right corner (any of A / ZR / R / ZL / L)
-  if (down & (HidNpadButton_A | HidNpadButton_ZR | HidNpadButton_R |
-              HidNpadButton_ZL | HidNpadButton_L)) {
-    pnew[VPTR_JUMP].active = 1;
-    pnew[VPTR_JUMP].x = w - 4.0f;
-    pnew[VPTR_JUMP].y = h - 4.0f;
+  // One click, anchored to the cursor.
+  //
+  // The port cannot tell a level from a menu, so a touch synthesised at a
+  // FIXED screen coordinate is wrong half the time: the old bottom-right jump
+  // tap landed on whatever UI happened to sit in that corner, which is issue
+  // #7 (the vault door in the custom level menu). Anchoring to the cursor
+  // removes the guesswork -- in a level ANY tap jumps, so the position is
+  // irrelevant there, while in a menu it clicks exactly what the player aimed
+  // at. With the cursor hidden (sticks idle, i.e. not navigating a menu) we
+  // tap click_zone instead, which defaults to the level-select level box --
+  // irrelevant in a level, where any tap jumps regardless, but it means the
+  // click button works on the level box without aiming the cursor first.
+  if (down & g_click_mask) {
+    pnew[VPTR_CLICK].active = 1;
+    if (cursor_visible()) {
+      pnew[VPTR_CLICK].x = cursor_x;
+      pnew[VPTR_CLICK].y = cursor_y;
+    } else {
+      pnew[VPTR_CLICK].x = zone_px(config.click_zone_x, w);
+      pnew[VPTR_CLICK].y = zone_px(config.click_zone_y, h);
+    }
   }
 
-  // platformer move zones (positions ported from the Vita build: 95/225 x 480
-  // in 960x544 view space)
-  if (down & HidNpadButton_Left) {
+  // Platformer move zones. These have to land on the on-screen arrows, so they
+  // are unavoidably fixed positions -- and the defaults are inherited from the
+  // Vita port, which is no guarantee they match where THIS build draws them.
+  // Hence config.txt: set show_zones 1 to see the markers and aim them.
+  // Outside a platformer level they hit whatever is at that spot, so
+  // left_buttons / right_buttons can be set to "none" to disable them.
+  if (down & g_left_mask) {
     pnew[VPTR_LEFT].active = 1;
-    pnew[VPTR_LEFT].x = (95.0f / 960.0f) * w;
-    pnew[VPTR_LEFT].y = (480.0f / 544.0f) * h;
+    pnew[VPTR_LEFT].x = zone_px(config.left_zone_x, w);
+    pnew[VPTR_LEFT].y = zone_px(config.left_zone_y, h);
   }
-  if (down & HidNpadButton_Right) {
+  if (down & g_right_mask) {
     pnew[VPTR_RIGHT].active = 1;
-    pnew[VPTR_RIGHT].x = (225.0f / 960.0f) * w;
-    pnew[VPTR_RIGHT].y = (480.0f / 544.0f) * h;
-  }
-
-  // cursor click on A -- but only while the cursor is on screen (i.e. a stick
-  // was moved recently, meaning we're navigating a menu). In gameplay the stick
-  // is idle, the cursor is hidden, and A is purely the jump tap above, so the
-  // natural Switch confirm button never fires a stray tap mid-level.
-  if ((down & HidNpadButton_A) && cursor_visible()) {
-    pnew[VPTR_CURSOR].active = 1;
-    pnew[VPTR_CURSOR].x = cursor_x;
-    pnew[VPTR_CURSOR].y = cursor_y;
+    pnew[VPTR_RIGHT].x = zone_px(config.right_zone_x, w);
+    pnew[VPTR_RIGHT].y = zone_px(config.right_zone_y, h);
   }
 }
 
@@ -503,6 +631,10 @@ static void dispatch_pointers(void) {
       gd.touchesEnd(fake_env, NULL, i, pcur[i].x, pcur[i].y, ts);
   }
 
+  if (memcmp(pcur, pnew, sizeof(pcur)) != 0) {
+    g_state_dirty = 1; // a touch went down, moved, or lifted
+    g_last_input_tick = armGetSystemTick();
+  }
   memcpy(pcur, pnew, sizeof(pcur));
 }
 
@@ -514,12 +646,22 @@ static void update_input(void) {
   memset(pnew, 0, sizeof(pnew));
   build_touch_pointers();
   build_virtual_pointers();
+  for (int i = 0; i < MAX_POINTERS; i++) {
+    if (pnew[i].active) { // held button or finger down: still playing
+      g_last_input_tick = armGetSystemTick();
+      break;
+    }
+  }
   dispatch_pointers();
 
   // BACK (pause / dismiss): B or Plus, edge-triggered
   const u64 pressed = padGetButtonsDown(&pad);
-  if ((pressed & (HidNpadButton_B | HidNpadButton_Plus)) && !g_block_back_button)
+  if ((pressed & g_back_mask) && !g_block_back_button) {
+    g_state_dirty = 1;
+    g_back_pending = 1; // pausing / leaving a level: a safe moment to save
+    g_last_input_tick = armGetSystemTick();
     gd.keyDown(fake_env, NULL, AKEY_BACK);
+  }
 }
 
 static AppletHookCookie s_applet_hook;
@@ -533,6 +675,10 @@ static void force_save(void) {
     if (gm)
       gd.gmDoQuickSave(gm);
   }
+  g_saves_done++;
+  g_state_dirty = 0;
+  g_back_pending = 0;
+  g_last_save_tick = armGetSystemTick();
 }
 
 // pause/resume + save on focus change (HOME), like Android onPause/onResume
@@ -557,11 +703,24 @@ int main(int argc, char **argv) {
 
   paths_init(argc > 0 ? argv[0] : NULL);
 
-  if (read_config(path_config()) < 0)
-    write_config(path_config());
+  read_config(path_config());
+  // Rewrite every launch: otherwise keys added by a newer build never appear
+  // in an existing config.txt and silently run on defaults the user cannot see.
+  write_config(path_config());
+
+  g_click_mask = buttons_or_default(config.click_buttons,
+      HidNpadButton_A | HidNpadButton_ZR | HidNpadButton_R |
+      HidNpadButton_ZL | HidNpadButton_L);
+  g_left_mask  = buttons_or_default(config.left_buttons, HidNpadButton_Left);
+  g_right_mask = buttons_or_default(config.right_buttons, HidNpadButton_Right);
+  g_back_mask  = buttons_or_default(config.back_buttons,
+      HidNpadButton_B | HidNpadButton_Plus);
 
   check_syscalls();
   check_data();
+  asset_index_build(path_assets()); // one directory walk now, none per frame
+  // 89 MB holds every non-audio asset; the heap here is well over 1 GB
+  asset_cache_init(path_assets(), 96u * 1024u * 1024u);
   game_compat_detect_package(path_so_game());
   set_screen_size(config.screen_width, config.screen_height);
 
@@ -650,7 +809,13 @@ int main(int argc, char **argv) {
   init_egl();
   gd.init(fake_env, NULL, screen_width, screen_height);
 
-  cpu_boost(0);
+  cpu_boost(0); // drop the load-time boost; clocks are the user's business
+                // (sys-clk / Horizon OC), and boosting here would only fight
+                // them -- measured: it does not affect the remaining stalls.
+
+  // warm the asset cache in the background so the menu stops paying a
+  // filesystem open every time it shows a new icon
+  asset_prefetch_start();
 
   appletHook(&s_applet_hook, applet_focus_hook, NULL);
 
@@ -658,13 +823,30 @@ int main(int argc, char **argv) {
   while (appletMainLoop() && !g_quit) {
     update_input();
     gd.render(fake_env, NULL);
+    zones_render();
     cursor_render();
     eglSwapBuffers(s_dpy, s_surf);
-    if (++frame >= 60 * 20) { // ~20 s autosave
-      frame = 0;
+    // A BACK press means pausing or leaving a level -- the game is not in
+    // motion, so the ~250 ms save costs nothing. This is what guarantees a
+    // save whenever you come out of a level, rather than hoping for an idle
+    // window. Rate-limited so menu navigation does not save on every press.
+    if (g_back_pending && g_state_dirty &&
+        (armGetSystemTick() - g_last_save_tick) >
+            armGetSystemTickFreq() * SAVE_BACK_COOLDOWN)
       force_save();
+
+    if (++frame >= 60 * 20) { // ~20 s autosave, but only when it is safe
+      frame = 0;
+      const u64 idle = armGetSystemTick() - g_last_input_tick;
+      if (g_state_dirty &&
+          idle > armGetSystemTickFreq() * SAVE_IDLE_SECONDS)
+        force_save();
+      else
+        g_saves_skipped++; // mid-level, or nothing worth writing
     }
   }
+
+  asset_prefetch_stop(); // no background reads while we save and tear down
 
   if (s_app_focused) { // clean in-game quit; background path already saved
     gd.onPause(fake_env, NULL);

@@ -1,3 +1,29 @@
+> ### About this fork
+>
+> This is a fork of **[NaGaa95/gdash_nx](https://github.com/NaGaa95/gdash_nx)**.
+> **All credit for the port itself goes to NaGaa95** — they did the actual work
+> of getting Geometry Dash running on the Switch. The README below is theirs,
+> unchanged.
+>
+> I am not a developer and know very little programming. Every code change in
+> this fork was written by [Claude Code](https://claude.com/claude-code); my
+> part was describing the problems I was hitting, testing the builds on my
+> Switch, and reporting back what happened. The changes were arrived at by
+> measuring on real hardware rather than guessing, but they have had far less
+> review than upstream code, so treat them accordingly.
+>
+> **What this fork changes:** the periodic stutter (four separate causes, idle
+> stall time down from ~11.6% to ~1%), the ~20-second autosave freeze
+> ([#8](https://github.com/NaGaa95/gdash_nx/issues/8)), the stray corner taps in
+> menus ([#7](https://github.com/NaGaa95/gdash_nx/issues/7)), saves that persist
+> when you leave a level, and configurable controls. See
+> **[CHANGELOG.md](CHANGELOG.md)** for the detail.
+>
+> **No game files are included here**, exactly as upstream — you supply your own
+> legally-owned copy. Only the wrapper source is in this repository.
+
+---
+
 <div align=center>
 
 <img src="extras/banner.png" alt="Banner" width="60%">

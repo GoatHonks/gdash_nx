@@ -4,3 +4,13 @@ build/
 *.elf
 *.map
 Release/
+
+# Never commit game data. The port loads these at runtime from the SD card and
+# they belong to RobTop / FMOD -- only the wrapper source here is MIT.
+*.so
+assets/
+save/
+prefs.txt
+config.txt
+cacert.pem
+gdash_nx_port/

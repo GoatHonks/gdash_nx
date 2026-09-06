@@ -38,6 +38,19 @@ typedef struct {
   int screen_width;
   int screen_height;
   int cursor_speed;    // pointer speed for the stick-driven cursor, px/s at 720p
+  // Where the platformer arrow taps land, in PERCENT of the screen. The
+  // defaults are inherited from the Vita port and may not match this build.
+  int click_zone_x, click_zone_y; // where a click lands when the cursor is hidden
+  int left_zone_x, left_zone_y;
+  int right_zone_x, right_zone_y;
+  int show_zones;      // 1 = draw markers at those spots, to aim them
+  // Comma-separated Switch button names. Valid: A B X Y L R ZL ZR Plus Minus
+  // Up Down Left Right LStick RStick
+  // Comma-separated button names, or "none" to disable that control.
+  char click_buttons[96];  // tap at the cursor (jump in a level, click in a menu)
+  char left_buttons[96];   // tap the platformer left-arrow zone (fixed position)
+  char right_buttons[96];  // tap the platformer right-arrow zone (fixed position)
+  char back_buttons[96];   // Android BACK (pause, go back)
 } Config;
 
 extern Config config;
