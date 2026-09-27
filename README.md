@@ -158,6 +158,8 @@ Then `make`.
 * TheOfficialFloW for the original Android so-loader.
 * hatoving for the Geometry Dash PS Vita port this one is based on.
 * fgsfds for max_nx / the Switch so-loader groundwork reused here.
+* NaGaa95 for this Switch port.
+* GoatHonks for the fixes in this fork, written with Claude Code (see above).
 
 ### Support
 
